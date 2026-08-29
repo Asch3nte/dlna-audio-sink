@@ -278,7 +278,7 @@ class Capture:
     def start(self) -> None:
         if self.use_pulse:
             cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-                   "-fflags", "nobuffer", "-f", "pulse"] + \
+                   "-thread_queue_size", "2048", "-f", "pulse"] + \
                 channel_layout(self.channels) + ["-i", self.source] + \
                 self.fmt.encoder_args + ["-"]
             debug("capture:", " ".join(shlex.quote(c) for c in cmd))
@@ -303,7 +303,7 @@ class Capture:
                    "--rate", str(self.rate), "--channels", str(self.channels),
                    "-"]
         enc = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
-               "-fflags", "nobuffer",
+               "-thread_queue_size", "2048",
                "-f", "s16le", "-ar", str(self.rate),
                "-ac", str(self.channels)] + \
             channel_layout(self.channels) + ["-i", "-"] + \
@@ -311,7 +311,7 @@ class Capture:
         debug("capture:", " ".join(shlex.quote(c) for c in rec), "|",
               " ".join(shlex.quote(c) for c in enc))
         p1 = subprocess.Popen(rec, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
+                              stderr=subprocess.PIPE, bufsize=0)
         p2 = subprocess.Popen(enc, stdin=p1.stdout, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
         p1.stdout.close()
@@ -614,12 +614,13 @@ def discover(timeout: float = 4.0) -> list[Renderer]:
 
 class StreamState:
     def __init__(self, source: str, send_length: bool, rate: int,
-                 channels: int, use_pulse: bool):
+                 channels: int, use_pulse: bool, prebuffer: float = 2.0):
         self.source = source
         self.send_length = send_length
         self.rate = rate
         self.channels = channels
         self.use_pulse = use_pulse
+        self.prebuffer = prebuffer
         self.fmt: Format | None = None
         self.connections = 0          # total, ever - used to detect firewalls
         self.last_error = ""
@@ -708,9 +709,33 @@ def make_handler(state: StreamState):
 
             log(f"streaming {fmt.name} to {self.client_address[0]}")
             sent = 0
+
+            # We can only ever produce in real time, so a renderer that reads
+            # as fast as we write never builds any reserve: it plays with an
+            # almost empty buffer and the smallest hiccup - scheduler, GIL,
+            # Wi-Fi jitter - empties it and you hear a gap. Hand it a cushion
+            # up front, the way an Icecast server bursts on connect. It costs
+            # exactly this much extra delay, and buys that much tolerance.
+            if state.prebuffer > 0:
+                cushion, until = [], time.time() + state.prebuffer
+                while time.time() < until:
+                    c = cap.stdout.read(16384)
+                    if not c:
+                        break
+                    cushion.append(c)
+                try:
+                    for c in cushion:
+                        self.wfile.write(c)
+                        sent += len(c)
+                    debug(f"prebuffered {sent} bytes "
+                          f"({state.prebuffer:.1f}s cushion)")
+                except (BrokenPipeError, ConnectionResetError):
+                    cap.stop()
+                    return
+
             try:
                 while True:
-                    chunk = cap.stdout.read(4096)
+                    chunk = cap.stdout.read(16384)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -975,7 +1000,7 @@ def cmd_run(args) -> int:
 
     state = StreamState(source, send_length=not args.no_content_length,
                         rate=rate, channels=channels,
-                        use_pulse=use_pulse)
+                        use_pulse=use_pulse, prebuffer=args.prebuffer)
     bind_addr = args.bind
     if ":" in local_ip:                       # IPv6 renderer
         if bind_addr == "0.0.0.0":
@@ -1153,6 +1178,10 @@ def main() -> int:
                    help="SSDP discovery timeout")
     p.add_argument("--probe-timeout", type=float, default=25.0,
                    help="seconds to wait for a format to start playing")
+    p.add_argument("--prebuffer", type=float, default=2.0,
+                   help="seconds of audio handed to the renderer up front, so "
+                        "a hiccup does not empty its buffer. Raise it if the "
+                        "sound stutters, lower it for less delay (0 disables)")
     p.add_argument("--watchdog", type=float, default=20.0,
                    help="seconds between playback checks")
     p.add_argument("--no-content-length", action="store_true",
@@ -1166,6 +1195,8 @@ def main() -> int:
 
     if args.rate < 0 or args.channels < 0:
         die("--rate and --channels must be positive")
+    if args.prebuffer < 0:
+        die("--prebuffer cannot be negative")
     if args.list:
         return cmd_list(args)
     if args.list_sources:
