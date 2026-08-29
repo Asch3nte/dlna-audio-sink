@@ -105,8 +105,10 @@ dlna-audio-sink -r "Living Room" --source alsa_input.pci-0000_00_1f.3.analog-ste
 3. **`ffmpeg`** reads that source and encodes on the fly.
 4. **An HTTP server** serves the endless stream on an ephemeral port.
 5. **UPnP `AVTransport`** tells the renderer to play that URL.
-6. **A watchdog** restarts playback when the device stops, sleeps or changes
-   input, backing off if it keeps failing.
+6. **A watchdog** restarts playback when the device stops, sleeps, changes
+   input, silently stops reading, sticks in a vendor-specific transitional
+   state, or is about to reach the end of the length we declared. It backs off
+   if restarting keeps failing.
 
 ## Two things that make this harder than it looks
 
@@ -135,7 +137,7 @@ MP3 is reached only when a device refuses everything else, and it says so.
 | `--source` | | capture this source instead of creating a sink |
 | `-f`, `--format` | `auto` | force `flac`, `lpcm`, `wav` or `mp3` |
 | `-b`, `--bitrate` | `320k` | MP3 bitrate, if it falls back that far |
-| `--rate`, `--channels` | `44100`, `2` | sink audio parameters |
+| `--rate`, `--channels` | auto | negotiated from the device; override if needed |
 | `--sink-name`, `--description` | from device name | how it appears in the mixer |
 | `--force-sink` | off | recreate the sink instead of reusing one |
 | `--port`, `--bind`, `--local-ip` | auto | HTTP server placement |
@@ -171,6 +173,12 @@ unit (`systemctl --user`), because that is where PipeWire lives.
 **Latency is 2–5 seconds**, inherent to renderer buffering. Fine for music,
 useless for video — the picture would drift out of sync.
 
+**The rate is the device's, not the source's.** L16 carries its sample rate in
+the MIME type, so a device that only advertises 44.1 kHz caps you there: a
+96 kHz album is resampled. The tool picks the highest rate the device
+advertises and pins the sink to it, so that conversion happens exactly once,
+in PipeWire, rather than twice.
+
 **Volume is separate.** The renderer keeps its own volume; the local slider
 does not drive it.
 
@@ -186,6 +194,21 @@ will not be synchronised with each other.
 Reports are very welcome, especially failures. Please include the output of
 `dlna-audio-sink --list` and a `--verbose` run — and redact your UDN and local
 addresses if you would rather not publish them.
+
+## Security
+
+The stream is **unauthenticated**: DLNA renderers cannot log in, so while the
+tool runs, anyone who can reach the port on your network can listen to what
+your computer is playing. That is inherent to the protocol. Restrict it with
+`--bind`, and think twice on an untrusted network. See
+[SECURITY.md](SECURITY.md) for the full picture and how to report a
+vulnerability.
+
+## Contributing
+
+Pull requests are welcome and every one is reviewed before merging; `main` is
+protected. Device reports — especially failures — are the most valuable
+contribution. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

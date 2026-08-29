@@ -205,7 +205,12 @@ class NullSink:
             return
         # device.description is parsed by the server as a shell-ish token:
         # quote it so names with spaces or apostrophes survive.
-        props = f"device.description={shlex.quote(self.description)}"
+        # audio.rate pins the node's rate. Without it PipeWire renegotiates
+        # the sink when a client of another rate connects (a 96 kHz track, say),
+        # which restarts our capture mid-stream and leaves the renderer running
+        # seconds behind, with nothing to ever catch it up again.
+        props = (f"device.description={shlex.quote(self.description)} "
+                 f"audio.rate={self.rate}")
         r = run(["pactl", "load-module", "module-null-sink",
                  f"sink_name={self.name}",
                  f"sink_properties={props}",
@@ -515,6 +520,31 @@ class Renderer:
         self._protocols = found
         return found
 
+    def advertised_rates(self) -> list[int]:
+        """Sample rates the device lists for L16, best first.
+
+        L16 carries its rate in the MIME type, so a device that only lists
+        44100 will not take anything else. Formats that carry the rate in-band
+        (FLAC, WAV) are not constrained this way.
+        """
+        rates = set()
+        for p in self.protocols():
+            if p.startswith("audio/l16"):
+                m = re.search(r"rate=(\d+)", p)
+                if m:
+                    rates.add(int(m.group(1)))
+        return sorted(rates, reverse=True)
+
+    def advertised_channels(self) -> list[int]:
+        """Channel counts the device lists for L16, best first."""
+        chans = set()
+        for p in self.protocols():
+            if p.startswith("audio/l16"):
+                m = re.search(r"channels=(\d+)", p)
+                if m:
+                    chans.add(int(m.group(1)))
+        return sorted(chans, reverse=True)
+
     def advertises(self, fmt: Format) -> bool:
         """Whether the device lists this format.
 
@@ -594,7 +624,14 @@ class StreamState:
         self.connections = 0          # total, ever - used to detect firewalls
         self.last_error = ""
         self.current: Capture | None = None
+        self.bytes_sent = 0           # since the last (re)start of the stream
+        self.active = 0               # connections currently being served
+        self.last_activity = 0.0
         self.lock = threading.Lock()
+
+    def reset_stream_accounting(self) -> None:
+        with self.lock:
+            self.bytes_sent = 0
 
 
 def make_handler(state: StreamState):
@@ -640,6 +677,9 @@ def make_handler(state: StreamState):
 
             with state.lock:
                 state.connections += 1
+                state.active += 1
+                state.bytes_sent = 0
+                state.last_activity = time.time()
                 # Only one stream at a time: a reconnecting renderer must not
                 # leave an orphaned encoder running.
                 if state.current is not None:
@@ -675,6 +715,9 @@ def make_handler(state: StreamState):
                         break
                     self.wfile.write(chunk)
                     sent += len(chunk)
+                    with state.lock:
+                        state.bytes_sent += len(chunk)
+                        state.last_activity = time.time()
             except (BrokenPipeError, ConnectionResetError):
                 debug(f"client closed the stream after {sent} bytes")
             except Exception as e:
@@ -685,14 +728,19 @@ def make_handler(state: StreamState):
                     log(f"capture produced nothing: {state.last_error}")
                 cap.stop()
                 with state.lock:
+                    state.active -= 1
                     if state.current is cap:
                         state.current = None
     return Handler
 
 
 def source_ip_towards(host: str) -> str | None:
-    """Local address the kernel would use to reach `host`."""
-    for family in (socket.AF_INET6, socket.AF_INET):
+    """Local address the kernel would use to reach `host`.
+
+    IPv4 is tried first: advertising an IPv6 URL while the HTTP server listens
+    on 0.0.0.0 gives a renderer an address it can never connect to.
+    """
+    for family in (socket.AF_INET, socket.AF_INET6):
         try:
             infos = socket.getaddrinfo(host, 9, family, socket.SOCK_DGRAM)
         except OSError:
@@ -749,6 +797,8 @@ def negotiate(renderer: Renderer, state: StreamState, url: str, formats,
             continue
         tried.append(fmt.name)
         log(f"trying {fmt.name}...")
+        # Clear the previous attempt's error, or it aborts this one instantly.
+        state.last_error = ""
         state.fmt = fmt
         try:
             renderer.play_url(url, fmt, title)
@@ -880,6 +930,27 @@ def cmd_run(args) -> int:
     renderer = pick_renderer(args.renderer or "", args.timeout)
     log(f"renderer: {renderer.name} ({renderer.host})")
 
+    # Pick the sample rate before creating anything: the sink is pinned to it,
+    # so the resampling happens once, in PipeWire, instead of twice.
+    rate = args.rate
+    if not rate:
+        advertised = renderer.advertised_rates()
+        rate = advertised[0] if advertised else 44100
+        if advertised:
+            log(f"sample rate: {rate} Hz (highest the device advertises)")
+            if len(advertised) > 1:
+                debug(f"device also accepts {advertised[1:]}")
+        else:
+            debug("device advertises no LPCM rate; defaulting to 44100 Hz")
+
+    channels = args.channels
+    if not channels:
+        offered = renderer.advertised_channels()
+        # Stereo when the device takes it; otherwise the most it will accept.
+        channels = 2 if 2 in offered else (offered[0] if offered else 2)
+        if offered and channels != 2:
+            log(f"channels: {channels} (the device does not advertise stereo)")
+
     local_ip = args.local_ip or source_ip_towards(renderer.host)
     if not local_ip:
         die(f"cannot work out which local address reaches {renderer.host}",
@@ -898,15 +969,20 @@ def cmd_run(args) -> int:
     else:
         sink_name = args.sink_name or sanitize(renderer.name)
         label = args.description or renderer.name
-        sink = NullSink(sink_name, label, args.rate, args.channels)
+        sink = NullSink(sink_name, label, rate, channels)
         sink.create(force=args.force_sink)
         source = sink.monitor
 
     state = StreamState(source, send_length=not args.no_content_length,
-                        rate=args.rate, channels=args.channels,
+                        rate=rate, channels=channels,
                         use_pulse=use_pulse)
+    bind_addr = args.bind
+    if ":" in local_ip:                       # IPv6 renderer
+        if bind_addr == "0.0.0.0":
+            bind_addr = "::"
+        ThreadingHTTPServer.address_family = socket.AF_INET6
     try:
-        httpd = ThreadingHTTPServer((args.bind, args.port),
+        httpd = ThreadingHTTPServer((bind_addr, args.port),
                                     make_handler(state))
     except OSError as e:
         if sink:
@@ -914,7 +990,7 @@ def cmd_run(args) -> int:
         if e.errno == errno.EADDRINUSE:
             die(f"port {args.port} is already in use",
                 "leave --port out to get a free one automatically.")
-        die(f"cannot listen on {args.bind}:{args.port}: {e}")
+        die(f"cannot listen on {bind_addr}:{args.port}: {e}")
     httpd.daemon_threads = True
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -939,7 +1015,7 @@ def cmd_run(args) -> int:
         if sink:
             sink.destroy()
 
-    formats = build_formats(args.rate, args.channels, args.bitrate)
+    formats = build_formats(rate, channels, args.bitrate)
     forced = args.format != "auto"
     if forced:
         formats = [f for f in formats if f.name == args.format]
@@ -966,24 +1042,68 @@ def cmd_run(args) -> int:
             "candidate")
     log(f"ready - select '{label}' as your audio output")
 
-    # Watchdog: renderers drop the stream when they sleep or change input.
-    # Back off so a permanently broken device does not spin.
+    # Watchdog. Three distinct ways playback dies, all seen in practice:
+    #
+    #  * the renderer stops on its own (sleep, input change) -> idle state;
+    #  * it keeps claiming to play while our stream is long gone -> no bytes;
+    #  * it consumes the whole Content-Length we invented and treats the
+    #    "file" as finished. At LPCM that budget is only about three hours,
+    #    so we restart before it runs out rather than after.
     delay = args.watchdog
+    not_playing = 0
+
+    def restart(reason: str) -> bool:
+        nonlocal delay
+        log(f"{reason}; restarting the stream")
+        try:
+            renderer.play_url(url, fmt, args.title)
+            delay = args.watchdog
+            return True
+        except Exception as e:
+            delay = min(delay * 2, 300)
+            log(f"restart failed ({type(e).__name__}); retrying in "
+                f"{delay:.0f}s")
+            return False
+
     while not stopping.is_set():
         if stopping.wait(delay):
             break
+
+        with state.lock:
+            sent = state.bytes_sent
+            active = state.active
+            quiet = time.time() - state.last_activity
+
+        # Renew well before the renderer reaches the declared length.
+        if sent > FAKE_LENGTH * 0.85:
+            restart(f"approaching the declared stream length ({sent} bytes)")
+            not_playing = 0
+            continue
+
         st = renderer.transport_state()
+
         if st in IDLE_STATES:
-            log(f"renderer went to {st}, restarting the stream")
-            try:
-                renderer.play_url(url, fmt, args.title)
-                delay = args.watchdog
-            except Exception as e:
-                delay = min(delay * 2, 300)
-                log(f"restart failed ({type(e).__name__}); retrying in "
-                    f"{delay:.0f}s")
-        else:
-            delay = args.watchdog
+            restart(f"renderer went to {st}")
+            not_playing = 0
+            continue
+
+        # It says it is playing, but nothing is being read from us.
+        if active == 0 and quiet > max(30.0, args.watchdog * 2):
+            restart(f"no data read for {quiet:.0f}s while state={st}")
+            not_playing = 0
+            continue
+
+        # Never reached PLAYING: a vendor state such as LG_TRANSITIONING can
+        # stick forever, and waiting on an exact name would wait for ever too.
+        if st != "PLAYING":
+            not_playing += 1
+            if not_playing >= 3:
+                restart(f"stuck in state={st}")
+                not_playing = 0
+            continue
+
+        not_playing = 0
+        delay = args.watchdog
 
     shutdown()
     return 0
@@ -1015,8 +1135,10 @@ def main() -> int:
                    help="stream format (default: auto-negotiated)")
     p.add_argument("-b", "--bitrate", default="320k",
                    help="MP3 bitrate, when it falls back that far")
-    p.add_argument("--rate", type=int, default=44100, help="sample rate")
-    p.add_argument("--channels", type=int, default=2, help="channel count")
+    p.add_argument("--rate", type=int, default=0,
+                   help="sample rate (default: the best the device advertises)")
+    p.add_argument("--channels", type=int, default=0,
+                   help="channel count (default: what the device takes)")
     p.add_argument("--sink-name", help="PipeWire sink name")
     p.add_argument("--description", help="label shown in audio settings")
     p.add_argument("--force-sink", action="store_true",
@@ -1042,7 +1164,7 @@ def main() -> int:
     args = p.parse_args()
     VERBOSE = args.verbose
 
-    if args.rate <= 0 or args.channels <= 0:
+    if args.rate < 0 or args.channels < 0:
         die("--rate and --channels must be positive")
     if args.list:
         return cmd_list(args)

@@ -1,0 +1,53 @@
+name: CI
+
+# `pull_request` runs the fork's code with a read-only token and no access to
+# secrets. It is deliberately NOT `pull_request_target`, which would run
+# untrusted code with this repository's credentials - the classic "pwn
+# request" that turns CI into a code-injection path.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The README promises 3.9+; check that promise on every version.
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile
+        run: python -m py_compile dlna-audio-sink
+
+      - name: Run without a sound server
+        # No audio stack on a runner, so these must work purely offline.
+        run: |
+          python dlna-audio-sink --version
+          python dlna-audio-sink --help > /dev/null
+
+      - name: Reject invalid arguments
+        run: |
+          if python dlna-audio-sink --rate 0 2>/dev/null; then
+            echo "--rate 0 should have been rejected" >&2
+            exit 1
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.14.2
+      - run: ruff check --target-version py39 dlna-audio-sink
