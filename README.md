@@ -33,7 +33,7 @@ No cable, no extra hardware.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/dlna-audio-sink
+git clone https://github.com/Asch3nte/dlna-audio-sink
 cd dlna-audio-sink
 ./install.sh          # installs to ~/.local/bin + a systemd user unit
 ```
