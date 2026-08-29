@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""dlna-audio-sink - use any DLNA/UPnP MediaRenderer as a system audio output.
+
+Creates a PipeWire/PulseAudio null sink, captures its monitor, encodes the
+audio and serves it over HTTP, then tells the renderer (a TV, an AV receiver,
+a networked speaker) to play that stream. The renderer shows up like any other
+output device, so a TV's own audio path - including HDMI ARC to an amplifier -
+becomes usable from the computer with no cable.
+
+Two hard-won details drive the design:
+
+* Many renderers hang forever in a "transitioning" state when the HTTP response
+  carries no Content-Length, because they try to buffer a file of unknown size.
+  We therefore advertise a huge bogus Content-Length for the endless stream.
+
+* Renderers routinely advertise formats they cannot actually stream. An LG C9
+  lists FLAC and LPCM in GetProtocolInfo yet only ever plays MP3. So we probe
+  candidate formats in order and keep the first that genuinely reaches PLAYING.
+
+Licensed under the MIT License.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+__version__ = "1.0.0"
+
+SSDP_ADDR = "239.255.255.250"
+SSDP_PORT = 1900
+RENDERER_ST = "urn:schemas-upnp-org:device:MediaRenderer:1"
+AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+CM = "urn:schemas-upnp-org:service:ConnectionManager:1"
+
+# Bogus length advertised for the endless stream. Large enough that no renderer
+# reaches it, small enough to stay inside a signed 32-bit field.
+FAKE_LENGTH = 0x7FFFFFF0
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "dlna-audio-sink")
+
+VERBOSE = False
+
+
+def log(*a) -> None:
+    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+def debug(*a) -> None:
+    if VERBOSE:
+        log("debug:", *a)
+
+
+# --------------------------------------------------------------------------
+# Audio formats
+# --------------------------------------------------------------------------
+
+class Format:
+    """An encoding we can offer to a renderer.
+
+    `mime_match` is what we look for in the renderer's advertised sink
+    protocols; `content_type` is what we actually send back.
+    """
+
+    def __init__(self, name, mime_match, content_type, dlna_pn, ffmpeg_args,
+                 lossless):
+        self.name = name
+        self.mime_match = mime_match
+        self.content_type = content_type
+        self.dlna_pn = dlna_pn
+        self.ffmpeg_args = ffmpeg_args
+        self.lossless = lossless
+
+    def __repr__(self):
+        return f"<Format {self.name}>"
+
+
+def build_formats(rate: int, channels: int, bitrate: str) -> list[Format]:
+    """Candidate encodings, best quality first."""
+    return [
+        Format("flac", "audio/flac", "audio/flac", "FLAC",
+               ["-c:a", "flac", "-f", "flac"], True),
+        Format("lpcm", "audio/l16",
+               f"audio/L16;rate={rate};channels={channels}", "LPCM",
+               ["-f", "s16be", "-ar", str(rate), "-ac", str(channels)], True),
+        Format("wav", "audio/wav", "audio/wav", None,
+               ["-f", "wav"], True),
+        Format("mp3", "audio/mpeg", "audio/mpeg", "MP3",
+               ["-c:a", "libmp3lame", "-b:a", bitrate, "-f", "mp3"], False),
+    ]
+
+
+# --------------------------------------------------------------------------
+# SSDP discovery
+# --------------------------------------------------------------------------
+
+def local_ipv4_addresses() -> list[str]:
+    """Every usable local IPv4 address, so discovery covers each subnet."""
+    addrs = set()
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True,
+                             text=True).stdout
+        for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)", out):
+            ip = m.group(1)
+            if not ip.startswith("127."):
+                addrs.add(ip)
+    except FileNotFoundError:
+        pass
+    if not addrs:
+        addrs.add("0.0.0.0")
+    return sorted(addrs)
+
+
+def ssdp_search(timeout: float = 4.0) -> list[str]:
+    """Return description URLs of every MediaRenderer that answers."""
+    msg = ("M-SEARCH * HTTP/1.1\r\n"
+           f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+           'MAN: "ssdp:discover"\r\n'
+           f"MX: {int(timeout)}\r\n"
+           f"ST: {RENDERER_ST}\r\n\r\n").encode()
+
+    locations: set[str] = set()
+    socks = []
+    for src in local_ipv4_addresses():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+            s.bind((src, 0))
+            s.settimeout(0.5)
+            s.sendto(msg, (SSDP_ADDR, SSDP_PORT))
+            socks.append(s)
+        except OSError as e:
+            debug(f"SSDP bind {src}: {e}")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for s in socks:
+            try:
+                data, _ = s.recvfrom(65507)
+            except (socket.timeout, OSError):
+                continue
+            for line in data.decode("utf-8", "replace").splitlines():
+                if line.upper().startswith("LOCATION:"):
+                    locations.add(line.split(":", 1)[1].strip())
+    for s in socks:
+        s.close()
+    return sorted(locations)
+
+
+# --------------------------------------------------------------------------
+# Renderer
+# --------------------------------------------------------------------------
+
+def _strip_ns(tag: str) -> str:
+    return tag.split("}", 1)[-1]
+
+
+class Renderer:
+    def __init__(self, location: str):
+        self.location = location
+        self.base = re.match(r"(https?://[^/]+)", location).group(1)
+        self.name = "?"
+        self.manufacturer = ""
+        self.model = ""
+        self.udn = ""
+        self.services: dict[str, str] = {}
+        self._protocols: set[str] | None = None
+
+    # -- description ------------------------------------------------------
+    @classmethod
+    def from_location(cls, location: str, timeout: float = 6.0):
+        r = cls(location)
+        try:
+            raw = urllib.request.urlopen(location, timeout=timeout).read()
+        except Exception as e:
+            debug(f"description {location}: {e}")
+            return None
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as e:
+            debug(f"parse {location}: {e}")
+            return None
+
+        dev = None
+        for el in root.iter():
+            if _strip_ns(el.tag) == "device":
+                dev = el
+                break
+        if dev is None:
+            return None
+
+        for el in dev:
+            t = _strip_ns(el.tag)
+            if t == "friendlyName":
+                r.name = (el.text or "?").strip()
+            elif t == "manufacturer":
+                r.manufacturer = (el.text or "").strip()
+            elif t == "modelName":
+                r.model = (el.text or "").strip()
+            elif t == "UDN":
+                r.udn = (el.text or "").strip()
+
+        for svc in root.iter():
+            if _strip_ns(svc.tag) != "service":
+                continue
+            stype = ctrl = None
+            for c in svc:
+                if _strip_ns(c.tag) == "serviceType":
+                    stype = (c.text or "").strip()
+                elif _strip_ns(c.tag) == "controlURL":
+                    ctrl = (c.text or "").strip()
+            if stype and ctrl:
+                url = ctrl if ctrl.startswith("http") else \
+                    r.base + (ctrl if ctrl.startswith("/") else "/" + ctrl)
+                r.services[stype] = url
+
+        if AVT not in r.services:
+            debug(f"{r.name}: no AVTransport, skipped")
+            return None
+        return r
+
+    @property
+    def host(self) -> str:
+        return re.match(r"https?://([^:/]+)", self.base).group(1)
+
+    # -- SOAP -------------------------------------------------------------
+    def soap(self, service: str, action: str, body: str = "",
+             timeout: float = 20.0) -> str:
+        url = self.services[service]
+        stype = service
+        env = ('<?xml version="1.0"?><s:Envelope '
+               'xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+               's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+               f'<s:Body><u:{action} xmlns:u="{stype}">{body}'
+               f'</u:{action}></s:Body></s:Envelope>')
+        req = urllib.request.Request(url, data=env.encode(), headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{stype}#{action}"'})
+        return urllib.request.urlopen(req, timeout=timeout).read() \
+            .decode("utf-8", "replace")
+
+    def avt(self, action: str, body: str = "", timeout: float = 20.0) -> str:
+        return self.soap(AVT, action, f"<InstanceID>0</InstanceID>{body}",
+                         timeout)
+
+    # -- capabilities -----------------------------------------------------
+    def protocols(self) -> set[str]:
+        """Lower-cased MIME types the renderer claims it can sink."""
+        if self._protocols is not None:
+            return self._protocols
+        found: set[str] = set()
+        if CM in self.services:
+            try:
+                r = self.soap(CM, "GetProtocolInfo", timeout=10)
+                m = re.search(r"<Sink>(.*?)</Sink>", r, re.S)
+                blob = m.group(1) if m else r
+                for entry in html.unescape(blob).split(","):
+                    parts = entry.split(":")
+                    if len(parts) >= 3 and parts[2].startswith("audio/"):
+                        found.add(parts[2].strip().lower())
+            except Exception as e:
+                debug(f"{self.name}: GetProtocolInfo failed: {e}")
+        self._protocols = found
+        return found
+
+    def supports(self, fmt: Format) -> bool:
+        """True if the renderer advertises this format, or advertises nothing.
+
+        An empty protocol list means the device refused to tell us; we then let
+        the probe decide rather than giving up.
+        """
+        protos = self.protocols()
+        if not protos:
+            return True
+        return any(p.startswith(fmt.mime_match) for p in protos)
+
+    def transport_state(self) -> str:
+        try:
+            r = self.avt("GetTransportInfo", timeout=10)
+            m = re.search(r"<CurrentTransportState>([^<]*)", r)
+            return m.group(1) if m else "?"
+        except Exception:
+            return "?"
+
+    def stop(self) -> None:
+        try:
+            self.avt("Stop", timeout=8)
+        except Exception:
+            pass
+
+    def play_url(self, url: str, fmt: Format, title: str) -> None:
+        proto = f"http-get:*:{fmt.content_type}:"
+        proto += f"DLNA.ORG_PN={fmt.dlna_pn}" if fmt.dlna_pn else "*"
+        didl = ('<DIDL-Lite '
+                'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+                'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+                'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+                '<item id="1" parentID="0" restricted="1">'
+                f'<dc:title>{html.escape(title)}</dc:title>'
+                '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
+                f'<res protocolInfo="{html.escape(proto)}">'
+                f'{html.escape(url)}</res></item></DIDL-Lite>')
+        self.stop()
+        time.sleep(1)
+        self.avt("SetAVTransportURI",
+                 f"<CurrentURI>{html.escape(url)}</CurrentURI>"
+                 f"<CurrentURIMetaData>{html.escape(didl)}</CurrentURIMetaData>")
+        time.sleep(1)
+        # A renderer that dislikes the stream often never answers Play at all,
+        # so a timeout here is not fatal - the state poll is what decides.
+        try:
+            self.avt("Play", "<Speed>1</Speed>", timeout=12)
+        except Exception as e:
+            debug(f"Play did not answer: {type(e).__name__}")
+
+
+def discover(timeout: float = 4.0) -> list[Renderer]:
+    out = []
+    for loc in ssdp_search(timeout):
+        r = Renderer.from_location(loc)
+        if r:
+            out.append(r)
+    out.sort(key=lambda r: r.name.lower())
+    return out
+
+
+# --------------------------------------------------------------------------
+# Local audio sink
+# --------------------------------------------------------------------------
+
+def sanitize(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-")
+    return s or "dlna"
+
+
+class NullSink:
+    """A PipeWire/PulseAudio null sink whose monitor we capture."""
+
+    def __init__(self, sink_name: str, description: str, rate: int, channels: int):
+        self.name = sink_name
+        self.description = description
+        self.rate = rate
+        self.channels = channels
+        self.module: str | None = None
+
+    def create(self) -> None:
+        existing = subprocess.run(["pactl", "list", "short", "modules"],
+                                  capture_output=True, text=True).stdout
+        if f"sink_name={self.name}" in existing:
+            log(f"sink '{self.name}' already present, reusing it")
+            return
+        r = subprocess.run(
+            ["pactl", "load-module", "module-null-sink",
+             f"sink_name={self.name}",
+             f"sink_properties=device.description='{self.description}'",
+             f"rate={self.rate}", f"channels={self.channels}"],
+            capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"could not create sink: {r.stderr.strip()}")
+        self.module = r.stdout.strip()
+        log(f"sink '{self.name}' created (module {self.module})")
+
+    def destroy(self) -> None:
+        if self.module:
+            subprocess.run(["pactl", "unload-module", self.module],
+                           capture_output=True)
+            self.module = None
+
+    @property
+    def monitor(self) -> str:
+        return f"{self.name}.monitor"
+
+
+# --------------------------------------------------------------------------
+# HTTP streaming
+# --------------------------------------------------------------------------
+
+class StreamState:
+    """Shared between the HTTP handler and the main thread."""
+
+    def __init__(self, monitor: str, send_length: bool):
+        self.monitor = monitor
+        self.send_length = send_length
+        self.fmt: Format | None = None
+        self.clients = 0
+        self.lock = threading.Lock()
+
+
+def make_handler(state: StreamState):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            debug(f"{self.command} {self.path} <- {self.client_address[0]}")
+
+        def _headers(self):
+            fmt = state.fmt
+            self.send_response(200)
+            self.send_header("Content-Type", fmt.content_type)
+            if state.send_length:
+                self.send_header("Content-Length", str(FAKE_LENGTH))
+            self.send_header("transferMode.dlna.org", "Streaming")
+            feat = (f"DLNA.ORG_PN={fmt.dlna_pn};" if fmt.dlna_pn else "")
+            self.send_header(
+                "contentFeatures.dlna.org",
+                feat + "DLNA.ORG_OP=00;DLNA.ORG_CI=0;"
+                "DLNA.ORG_FLAGS=01700000000000000000000000000000")
+            self.end_headers()
+
+        def do_HEAD(self):
+            self._headers()
+
+        def do_GET(self):
+            fmt = state.fmt
+            if fmt is None:
+                self.send_error(503)
+                return
+            self._headers()
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                   "-f", "pulse", "-i", state.monitor] + fmt.ffmpeg_args + ["-"]
+            debug("ffmpeg:", " ".join(cmd))
+            ff = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+            with state.lock:
+                state.clients += 1
+            log(f"streaming {fmt.name} to {self.client_address[0]}")
+            try:
+                while True:
+                    chunk = ff.stdout.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                debug("client closed the stream")
+            finally:
+                ff.kill()
+                ff.wait()
+                with state.lock:
+                    state.clients -= 1
+    return Handler
+
+
+def source_ip_towards(host: str) -> str:
+    """Local address the kernel would use to reach `host`."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 9))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+# --------------------------------------------------------------------------
+# Format negotiation
+# --------------------------------------------------------------------------
+
+def cache_path(udn: str) -> str:
+    return os.path.join(CACHE_DIR, sanitize(udn) + ".format")
+
+
+def remember_format(udn: str, name: str) -> None:
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cache_path(udn), "w") as f:
+            f.write(name)
+    except OSError:
+        pass
+
+
+def recall_format(udn: str) -> str | None:
+    try:
+        with open(cache_path(udn)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def negotiate(renderer: Renderer, state: StreamState, url: str,
+              formats: list[Format], title: str, probe_timeout: float) -> Format:
+    """Try each candidate until the renderer really reaches PLAYING."""
+    for fmt in formats:
+        if not renderer.supports(fmt):
+            debug(f"{fmt.name}: not advertised, skipped")
+            continue
+        log(f"trying {fmt.name}...")
+        state.fmt = fmt
+        try:
+            renderer.play_url(url, fmt, title)
+        except Exception as e:
+            log(f"  {fmt.name}: control failed ({type(e).__name__})")
+            continue
+        deadline = time.time() + probe_timeout
+        while time.time() < deadline:
+            st = renderer.transport_state()
+            if st == "PLAYING":
+                log(f"  {fmt.name}: accepted")
+                return fmt
+            if st in ("STOPPED", "NO_MEDIA_PRESENT") and \
+                    time.time() > deadline - probe_timeout + 6:
+                break
+            time.sleep(2)
+        log(f"  {fmt.name}: refused (state={renderer.transport_state()})")
+        renderer.stop()
+    raise RuntimeError("no supported format: the renderer refused every "
+                       "candidate stream")
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_list(args) -> int:
+    log(f"scanning for DLNA renderers ({args.timeout:.0f}s)...")
+    found = discover(args.timeout)
+    if not found:
+        print("\nNo MediaRenderer found.\n"
+              "Check that the device is powered on and on the same network,\n"
+              "and that UDP port 1900 is not blocked by a firewall.")
+        return 1
+    print(f"\n{len(found)} renderer(s):\n")
+    for i, r in enumerate(found, 1):
+        print(f"  [{i}] {r.name}")
+        print(f"      host   : {r.host}")
+        if r.manufacturer or r.model:
+            print(f"      device : {r.manufacturer} {r.model}".rstrip())
+        protos = sorted(r.protocols())
+        print(f"      audio  : {', '.join(protos) if protos else '(not advertised)'}")
+        print(f"      udn    : {r.udn}")
+        print()
+    print("Start one with:  dlna-audio-sink --renderer \"<name or part of it>\"")
+    return 0
+
+
+def pick_renderer(selector: str, timeout: float) -> Renderer:
+    if selector.startswith("http://") or selector.startswith("https://"):
+        r = Renderer.from_location(selector)
+        if not r:
+            raise SystemExit(f"no usable renderer at {selector}")
+        return r
+    found = discover(timeout)
+    if not found:
+        raise SystemExit("no MediaRenderer found on the network")
+    if selector:
+        low = selector.lower()
+        matches = [r for r in found
+                   if low in r.name.lower() or low in r.udn.lower()]
+        if not matches:
+            names = ", ".join(r.name for r in found)
+            raise SystemExit(f"no renderer matches '{selector}'. Found: {names}")
+        if len(matches) > 1:
+            names = ", ".join(r.name for r in matches)
+            raise SystemExit(f"'{selector}' is ambiguous: {names}")
+        return matches[0]
+    if len(found) > 1:
+        names = ", ".join(r.name for r in found)
+        raise SystemExit(f"several renderers found ({names}); "
+                         "pick one with --renderer")
+    return found[0]
+
+
+def cmd_run(args) -> int:
+    for tool in ("ffmpeg", "pactl"):
+        if not shutil.which(tool):
+            raise SystemExit(f"{tool} is required but was not found in PATH")
+
+    renderer = pick_renderer(args.renderer or "", args.timeout)
+    log(f"renderer: {renderer.name} ({renderer.host})")
+
+    local_ip = args.local_ip or source_ip_towards(renderer.host)
+    debug(f"local address towards renderer: {local_ip}")
+
+    sink_name = args.sink_name or sanitize(renderer.name)[:31]
+    description = args.description or renderer.name
+    sink = NullSink(sink_name, description, args.rate, args.channels)
+    sink.create()
+
+    state = StreamState(sink.monitor, send_length=not args.no_content_length)
+    handler = make_handler(state)
+    httpd = ThreadingHTTPServer((args.bind, args.port), handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = f"http://{local_ip}:{port}/stream"
+    log(f"serving {url}")
+
+    stopping = threading.Event()
+
+    def cleanup(*_):
+        if stopping.is_set():
+            return
+        stopping.set()
+        log("shutting down")
+        renderer.stop()
+        sink.destroy()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    formats = build_formats(args.rate, args.channels, args.bitrate)
+    if args.format != "auto":
+        formats = [f for f in formats if f.name == args.format]
+        if not formats:
+            raise SystemExit(f"unknown format '{args.format}'")
+    else:
+        remembered = recall_format(renderer.udn)
+        if remembered:
+            formats.sort(key=lambda f: f.name != remembered)
+            debug(f"cached working format: {remembered}")
+
+    try:
+        fmt = negotiate(renderer, state, url, formats, args.title,
+                        args.probe_timeout)
+    except RuntimeError as e:
+        sink.destroy()
+        raise SystemExit(str(e))
+
+    if args.format == "auto":
+        remember_format(renderer.udn, fmt.name)
+    if not fmt.lossless:
+        log(f"note: {fmt.name} is lossy; the renderer refused the lossless "
+            "candidates")
+
+    log(f"ready - select '{description}' as your audio output")
+
+    # Watchdog: some renderers drop the stream when they sleep or switch input.
+    while not stopping.is_set():
+        time.sleep(args.watchdog)
+        st = renderer.transport_state()
+        if st in ("STOPPED", "NO_MEDIA_PRESENT"):
+            log(f"renderer went to {st}, restarting the stream")
+            try:
+                renderer.play_url(url, fmt, args.title)
+            except Exception as e:
+                log(f"restart failed: {type(e).__name__}: {e}")
+    return 0
+
+
+def main() -> int:
+    global VERBOSE
+    p = argparse.ArgumentParser(
+        prog="dlna-audio-sink",
+        description="Use a DLNA/UPnP MediaRenderer (TV, AV receiver, speaker) "
+                    "as a system audio output.")
+    p.add_argument("--list", action="store_true",
+                   help="scan the network and list renderers, then exit")
+    p.add_argument("-r", "--renderer", metavar="NAME",
+                   help="renderer name (or part of it), UDN, or description URL")
+    p.add_argument("-f", "--format", default="auto",
+                   choices=["auto", "flac", "lpcm", "wav", "mp3"],
+                   help="stream format (default: auto-negotiated)")
+    p.add_argument("-b", "--bitrate", default="320k",
+                   help="MP3 bitrate when falling back to a lossy format")
+    p.add_argument("--rate", type=int, default=44100, help="sample rate")
+    p.add_argument("--channels", type=int, default=2, help="channel count")
+    p.add_argument("--sink-name", help="PipeWire sink name")
+    p.add_argument("--description", help="label shown in audio settings")
+    p.add_argument("--title", default="Computer audio",
+                   help="track title shown on the renderer")
+    p.add_argument("--port", type=int, default=0,
+                   help="HTTP port (default: an ephemeral one)")
+    p.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
+    p.add_argument("--local-ip", help="address the renderer should connect to")
+    p.add_argument("--timeout", type=float, default=4.0,
+                   help="SSDP discovery timeout")
+    p.add_argument("--probe-timeout", type=float, default=25.0,
+                   help="seconds to wait for a format to start playing")
+    p.add_argument("--watchdog", type=float, default=20.0,
+                   help="seconds between playback checks")
+    p.add_argument("--no-content-length", action="store_true",
+                   help="omit the bogus Content-Length (some renderers need "
+                        "it absent; most need it present)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
+    args = p.parse_args()
+    VERBOSE = args.verbose
+
+    if args.list:
+        return cmd_list(args)
+    return cmd_run(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

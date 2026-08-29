@@ -1,0 +1,16 @@
+[Unit]
+Description=DLNA audio sink -> %I
+Documentation=https://github.com/Asch3nte/dlna-audio-sink
+After=pipewire-pulse.socket pipewire.service network-online.target
+Wants=pipewire-pulse.socket
+
+[Service]
+Type=simple
+# %I is the instance name, passed straight to --renderer.
+# Escape names containing spaces with: systemd-escape 'Living room TV'
+ExecStart=%h/.local/bin/dlna-audio-sink --renderer "%I"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
