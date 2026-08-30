@@ -57,6 +57,11 @@ FAKE_LENGTH = 0x7FFFFFF0
 # (LG_TRANSITIONING, TRANSITIONING...), so we only treat these as final.
 IDLE_STATES = {"STOPPED", "NO_MEDIA_PRESENT", "PAUSED_PLAYBACK"}
 
+# Failed restarts we tolerate before deciding the renderer is really gone and
+# the sink has to go with it, and how often we then look for it to come back.
+UNREACHABLE_BEFORE_TEARDOWN = 3
+OFFLINE_POLL = 30.0
+
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "dlna-audio-sink")
@@ -192,7 +197,7 @@ class NullSink:
                 return parts[0]
         return None
 
-    def create(self, force: bool = False) -> None:
+    def create(self, force: bool = False, fatal: bool = True) -> bool:
         existing = self._find_module()
         if existing and force:
             log(f"unloading stale sink module {existing}")
@@ -202,7 +207,7 @@ class NullSink:
             log(f"sink '{self.name}' already exists, reusing it "
                 "(use --force-sink to recreate)")
             self.reused = True
-            return
+            return True
         # device.description is parsed by the server as a shell-ish token:
         # quote it so names with spaces or apostrophes survive.
         # audio.rate pins the node's rate. Without it PipeWire renegotiates
@@ -216,17 +221,38 @@ class NullSink:
                  f"sink_properties={props}",
                  f"rate={self.rate}", f"channels={self.channels}"])
         if r.returncode != 0:
-            die(f"could not create the audio sink: "
-                f"{(r.stderr or r.stdout).strip()}",
+            detail = (r.stderr or r.stdout).strip()
+            if not fatal:
+                log(f"could not recreate the audio sink: {detail}")
+                return False
+            die(f"could not create the audio sink: {detail}",
                 "is PipeWire or PulseAudio running for this user?")
         self.module = (r.stdout or "").strip()
         log(f"sink '{self.name}' created (module {self.module})")
+        return True
 
     def destroy(self) -> None:
         if self.module:
             run(["pactl", "unload-module", self.module])
             debug(f"sink module {self.module} unloaded")
             self.module = None
+
+    def teardown(self) -> None:
+        """Remove the sink even if we adopted it from an earlier run.
+
+        destroy() is the shutdown path and deliberately leaves alone a
+        module we did not load. This one runs when the renderer is gone,
+        and then the sink is actively harmful whoever created it: clients
+        keep being routed into a monitor nobody drains any more. So the
+        module goes either way, and create() can put it back later.
+        """
+        module = self.module or self._find_module()
+        if not module:
+            return
+        run(["pactl", "unload-module", module])
+        log(f"sink '{self.name}' removed (module {module})")
+        self.module = None
+        self.reused = False
 
     @property
     def monitor(self) -> str:
@@ -1077,14 +1103,56 @@ def cmd_run(args) -> int:
     delay = args.watchdog
     not_playing = 0
 
+    # A renderer that has gone away - switched off, asleep, dropped off the
+    # network - must not leave its sink behind. PipeWire keeps accepting
+    # clients on a sink whose monitor nobody drains any more, so anything
+    # routed there stops dead while still looking perfectly healthy: the
+    # stream shows up as running, the latency reads zero, and the player at
+    # the other end wedges. module-stream-restore is happy to route a client
+    # onto exactly this sink on its own, remembering a session from when the
+    # device was still up. Unloading the module moves those clients back to
+    # the default sink, which is where they would have been all along.
+    offline = False
+    unreachable = 0
+
+    def go_offline(reason: str) -> None:
+        nonlocal offline, unreachable, delay
+        offline = True
+        unreachable = 0
+        delay = OFFLINE_POLL
+        log(f"{reason}; removing the sink until the renderer is back")
+        with state.lock:
+            cap, state.current = state.current, None
+        if cap:
+            cap.stop()
+        state.reset_stream_accounting()
+        if sink:
+            sink.teardown()
+
+    def come_back(st: str) -> None:
+        nonlocal offline, delay, not_playing
+        if sink and not sink.create(force=True, fatal=False):
+            return                      # sound server busy; try again later
+        log(f"renderer answered again (state={st})")
+        offline = False
+        not_playing = 0
+        delay = args.watchdog
+        restart("resuming after the renderer came back")
+
     def restart(reason: str) -> bool:
-        nonlocal delay
+        nonlocal delay, unreachable
         log(f"{reason}; restarting the stream")
         try:
             renderer.play_url(url, fmt, args.title)
             delay = args.watchdog
+            unreachable = 0
             return True
         except Exception as e:
+            unreachable += 1
+            if not offline and unreachable >= UNREACHABLE_BEFORE_TEARDOWN:
+                log(f"restart failed ({type(e).__name__})")
+                go_offline(f"renderer unreachable after {unreachable} attempts")
+                return False
             delay = min(delay * 2, 300)
             log(f"restart failed ({type(e).__name__}); retrying in "
                 f"{delay:.0f}s")
@@ -1093,6 +1161,12 @@ def cmd_run(args) -> int:
     while not stopping.is_set():
         if stopping.wait(delay):
             break
+
+        if offline:
+            st = renderer.transport_state()
+            if st != "?":
+                come_back(st)
+            continue
 
         with state.lock:
             sent = state.bytes_sent

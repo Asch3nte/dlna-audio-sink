@@ -108,7 +108,10 @@ dlna-audio-sink -r "Living Room" --source alsa_input.pci-0000_00_1f.3.analog-ste
 6. **A watchdog** restarts playback when the device stops, sleeps, changes
    input, silently stops reading, sticks in a vendor-specific transitional
    state, or is about to reach the end of the length we declared. It backs off
-   if restarting keeps failing.
+   if restarting keeps failing, and once the renderer has stopped answering
+   altogether it **removes the sink** rather than leave a dead one behind
+   (see below). The sink comes back, and playback with it, as soon as the
+   device answers again.
 
 ## Two things that make this harder than it looks
 
@@ -165,6 +168,16 @@ could not reach it: a firewall is blocking the inbound HTTP port. Pin it with
 **"No usable sound server."** Under systemd this almost always means the unit
 is running system-wide instead of in your user session. It must be a *user*
 unit (`systemctl --user`), because that is where PipeWire lives.
+
+**The sink vanished from my audio settings.** The renderer stopped
+answering, so the sink was removed on purpose. A sink whose monitor nobody
+drains any more still accepts clients, and anything routed into it stops dead
+while looking perfectly healthy — a stream that reads as running, a latency of
+zero, and a silent player at the other end. Worse, `module-stream-restore`
+will route a client there by itself, remembering a session from when the
+device was still up. Removing the module hands those clients back to your
+default sink. Switch the device on and the sink reappears within half a
+minute.
 
 **The sound is delayed.** That is expected; see below.
 
