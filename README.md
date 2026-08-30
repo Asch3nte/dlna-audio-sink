@@ -105,9 +105,13 @@ dlna-audio-sink -r "Living Room" --source alsa_input.pci-0000_00_1f.3.analog-ste
 3. **`ffmpeg`** reads that source and encodes on the fly.
 4. **An HTTP server** serves the endless stream on an ephemeral port.
 5. **UPnP `AVTransport`** tells the renderer to play that URL.
-6. **A watchdog** restarts playback when the device stops, sleeps, changes
-   input, silently stops reading, sticks in a vendor-specific transitional
-   state, or is about to reach the end of the length we declared. It backs off
+6. **A watchdog** restarts playback when the device sleeps, changes input,
+   silently stops reading, sticks in a vendor-specific transitional state, or
+   is about to reach the end of the length we declared — but it takes *no*
+   for an answer: a pause is left alone, and a third stop in a row that we
+   never managed to play through is read as somebody wanting their device
+   back, so it releases the audio and exits. `--insist` restores the old
+   behaviour of always pushing playback back. It backs off
    if restarting keeps failing, and once the renderer has stopped answering
    altogether it **removes the sink** rather than leave a dead one behind
    (see below). Anything playing into it is handed to the default sink first
@@ -146,6 +150,7 @@ MP3 is reached only when a device refuses everything else, and it says so.
 | `--force-sink` | off | recreate the sink instead of reusing one |
 | `--port`, `--bind`, `--local-ip` | auto | HTTP server placement |
 | `--allow-any-client` | off | serve any host holding the URL, not just the renderer |
+| `--insist` | off | keep pushing playback even when stopped from the device |
 | `--timeout` | `4` | SSDP discovery window |
 | `--probe-timeout` | `25` | seconds allowed for a format to start |
 | `--watchdog` | `20` | seconds between playback checks |
@@ -170,6 +175,14 @@ could not reach it: a firewall is blocking the inbound HTTP port. Pin it with
 **"No usable sound server."** Under systemd this almost always means the unit
 is running system-wide instead of in your user session. It must be a *user*
 unit (`systemctl --user`), because that is where PipeWire lives.
+
+**I stopped it from the remote and it started again.** Once is by design —
+a device that stops on its own is usually a dropout worth recovering. Do it a
+third time without it settling in between and the tool concludes you meant it:
+it hands your streams back to the default output, removes the sink and exits.
+Pausing is respected immediately, with no restart at all. Bring it back with
+`systemctl --user restart dlna-audio-sink@<name>`, or run it with `--insist`
+if you want a sink that never lets go.
 
 **A device on my network was refused.** The log names the address it came
 from and the renderer's address it expected. Some devices fetch the stream

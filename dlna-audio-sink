@@ -58,7 +58,35 @@ FAKE_LENGTH = 0x7FFFFFF0
 
 # States meaning "not playing". Renderers invent their own transitional names
 # (LG_TRANSITIONING, TRANSITIONING...), so we only treat these as final.
-IDLE_STATES = {"STOPPED", "NO_MEDIA_PRESENT", "PAUSED_PLAYBACK"}
+STOPPED_STATES = {"STOPPED", "NO_MEDIA_PRESENT"}
+# Pausing is not a fault. Nobody's television pauses itself because the
+# network hiccuped: somebody pressed a button, and pushing playback back at
+# them is not a recovery, it is an argument.
+PAUSED_STATES = {"PAUSED_PLAYBACK", "PAUSED_RECORDING"}
+IDLE_STATES = STOPPED_STATES | PAUSED_STATES
+
+# Telling a dropout from a person pressing stop. A dropout leaves the device
+# unreachable or the stream stalled; a deliberate stop comes from a renderer
+# that is answering perfectly well and simply says STOPPED. Once can be an
+# accident - an input change, a blip. Three in a row, none of which we kept
+# playing for more than a moment, is somebody who wants their television
+# back, and the honest answer is to get out of the way.
+DELIBERATE_STOPS = 3
+SUSTAINED_PLAY = 60.0
+
+
+def count_stop(previous: int, lasted: float) -> int:
+    """Consecutive stops we have not managed to keep playing through.
+
+    A stop that follows a decent stretch of playback starts the count over:
+    somebody listened for a while and then stopped, which says nothing about
+    the stop before it.
+    """
+    return 1 if lasted > SUSTAINED_PLAY else previous + 1
+
+
+def stop_is_deliberate(stops: int, insist: bool = False) -> bool:
+    return not insist and stops >= DELIBERATE_STOPS
 
 # A renderer that has accepted nothing for this long is not coming back on
 # this connection. The number that matters most in this file: without it, a
@@ -1398,6 +1426,9 @@ def cmd_run(args) -> int:
     #    so we restart before it runs out rather than after.
     delay = args.watchdog
     not_playing = 0
+    paused_noted = False
+    clean_stops = 0
+    last_start = time.time()
 
     # A renderer that has gone away - switched off, asleep, dropped off the
     # network - must not leave its sink behind. PipeWire keeps accepting
@@ -1441,12 +1472,13 @@ def cmd_run(args) -> int:
         restart("resuming after the renderer came back")
 
     def restart(reason: str) -> bool:
-        nonlocal delay, unreachable
+        nonlocal delay, unreachable, last_start
         log(f"{reason}; restarting the stream")
         try:
             renderer.play_url(url, fmt, args.title)
             delay = args.watchdog
             unreachable = 0
+            last_start = time.time()
             return True
         except Exception as e:
             unreachable += 1
@@ -1482,7 +1514,23 @@ def cmd_run(args) -> int:
 
         st = renderer.transport_state()
 
-        if st in IDLE_STATES:
+        if st in PAUSED_STATES:
+            # Wait it out. It resumes on its own, or it does not; either way
+            # the choice is not ours to overrule.
+            if not paused_noted:
+                log(f"renderer is paused ({st}); leaving it be")
+                paused_noted = True
+            not_playing = 0
+            continue
+        paused_noted = False
+
+        if st in STOPPED_STATES:
+            clean_stops = count_stop(clean_stops, time.time() - last_start)
+            if stop_is_deliberate(clean_stops, args.insist):
+                log(f"stopped from the device {clean_stops} times without "
+                    f"settling; taking this as deliberate and releasing the "
+                    f"audio (--insist to keep pushing)")
+                break
             restart(f"renderer went to {st}")
             not_playing = 0
             continue
@@ -1563,6 +1611,9 @@ def main() -> int:
                         "sound stutters, lower it for less delay (0 disables)")
     p.add_argument("--watchdog", type=float, default=20.0,
                    help="seconds between playback checks")
+    p.add_argument("--insist", action="store_true",
+                   help="keep pushing playback back at the renderer even "
+                        "when it is stopped from the device itself")
     p.add_argument("--no-content-length", action="store_true",
                    help="omit the bogus Content-Length (a few renderers need "
                         "it absent; most need it present)")
