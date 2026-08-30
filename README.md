@@ -67,7 +67,7 @@ $ dlna-audio-sink --renderer "Living Room"
 
 renderer: Living Room TV (192.168.4.27)
 sink 'Living-Room-TV' created (module 12345678)
-serving http://192.168.4.10:45871/stream
+serving http://192.168.4.10:45871/stream/…
 trying flac...
   flac: refused (state=TRANSITIONING)
 trying lpcm...
@@ -145,6 +145,7 @@ MP3 is reached only when a device refuses everything else, and it says so.
 | `--sink-name`, `--description` | from device name | how it appears in the mixer |
 | `--force-sink` | off | recreate the sink instead of reusing one |
 | `--port`, `--bind`, `--local-ip` | auto | HTTP server placement |
+| `--allow-any-client` | off | serve any host holding the URL, not just the renderer |
 | `--timeout` | `4` | SSDP discovery window |
 | `--probe-timeout` | `25` | seconds allowed for a format to start |
 | `--watchdog` | `20` | seconds between playback checks |
@@ -169,6 +170,11 @@ could not reach it: a firewall is blocking the inbound HTTP port. Pin it with
 **"No usable sound server."** Under systemd this almost always means the unit
 is running system-wide instead of in your user session. It must be a *user*
 unit (`systemctl --user`), because that is where PipeWire lives.
+
+**A device on my network was refused.** The log names the address it came
+from and the renderer's address it expected. Some devices fetch the stream
+from a different interface than the one they answered SSDP on; `--allow-any-client`
+covers that case.
 
 **The sink vanished from my audio settings.** The renderer stopped
 answering, so the sink was removed on purpose: one that leads nowhere is worse
@@ -215,12 +221,28 @@ addresses if you would rather not publish them.
 
 ## Security
 
-The stream is **unauthenticated**: DLNA renderers cannot log in, so while the
-tool runs, anyone who can reach the port on your network can listen to what
-your computer is playing. That is inherent to the protocol. Restrict it with
-`--bind`, and think twice on an untrusted network. See
-[SECURITY.md](SECURITY.md) for the full picture and how to report a
-vulnerability.
+The stream carries whatever this computer is playing, so the URL is treated as
+a capability. Two things guard it, and neither is optional:
+
+* the path holds a random token minted at startup, compared in constant time,
+  so the endpoint cannot be found by scanning the port;
+* requests are served only to the renderer's own address. `--allow-any-client`
+  lifts that, for the rare device that fetches from a different address than
+  it answers on — it does not lift the token.
+
+**What this does not protect against.** DLNA has no transport security: the
+URL is handed to the renderer in a plain SOAP call, so anyone in a position
+to watch that traffic sees the token. The address check still stands in their
+way, and an attacker who can also spoof the renderer's address is already
+inside your network. Think twice all the same on a network you do not trust.
+
+Discovery is treated as hostile input too. Anything can answer an SSDP search,
+so a description is only fetched from the address that answered, over http(s)
+only, with no redirects, capped in size and in time, and rejected outright if
+it carries a DTD. `--source` will stream a capture device — a microphone —
+if you point it at one, and says so when you do.
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 ## Contributing
 

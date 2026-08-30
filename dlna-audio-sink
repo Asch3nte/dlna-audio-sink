@@ -24,9 +24,12 @@ from __future__ import annotations
 import argparse
 import collections
 import errno
+import hmac
 import html
 import os
 import re
+import secrets
+import selectors
 import shlex
 import shutil
 import signal
@@ -56,6 +59,23 @@ FAKE_LENGTH = 0x7FFFFFF0
 # States meaning "not playing". Renderers invent their own transitional names
 # (LG_TRANSITIONING, TRANSITIONING...), so we only treat these as final.
 IDLE_STATES = {"STOPPED", "NO_MEDIA_PRESENT", "PAUSED_PLAYBACK"}
+
+# A renderer that has accepted nothing for this long is not coming back on
+# this connection. The number that matters most in this file: without it, a
+# stalled reader blocks the write, the encoder's pipe fills, and it stops
+# draining the audio monitor - network backpressure reaching the sound graph.
+CLIENT_SEND_TIMEOUT = 10.0
+# Reading a request line has to be bounded too, or a peer that connects and
+# says nothing keeps a thread for ever.
+CLIENT_READ_TIMEOUT = 20.0
+# An encoder producing nothing for this long is dead, whatever it claims.
+CAPTURE_READ_TIMEOUT = 10.0
+# Concurrent streams we are willing to serve. One renderer needs one.
+MAX_STREAM_CLIENTS = 4
+# Device descriptions are a few kilobytes; anything larger is not one.
+MAX_DESCRIPTION_BYTES = 512 * 1024
+# Same for SOAP answers: a transport state is a few hundred bytes.
+MAX_SOAP_BYTES = 256 * 1024
 
 # Failed restarts we tolerate before deciding the renderer is really gone and
 # the sink has to go with it, and how often we then look for it to come back.
@@ -131,8 +151,22 @@ FORMAT_NAMES = ["flac", "lpcm", "wav", "mp3"]
 # Local audio stack
 # --------------------------------------------------------------------------
 
-def run(cmd, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+def run(cmd, timeout: float = 10.0, **kw) -> subprocess.CompletedProcess:
+    """Run a helper, and come back whatever happens.
+
+    Everything here shells out to pactl, including the watchdog thread. A
+    sound server that stops answering must cost us one call, not the thread
+    that was supposed to notice the trouble - so a stall is reported as a
+    failed command rather than left to hang.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, 1, "", f"'{cmd[0]}' did not answer within {timeout:g}s")
+    except OSError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
 
 
 def audio_server_ok() -> tuple[bool, str]:
@@ -206,12 +240,15 @@ class NullSink:
         return None
 
     def _default_sink(self) -> str | None:
-        r = run(["pactl", "info"])
-        for line in (r.stdout or "").splitlines():
-            if line.startswith("Default Sink:"):
-                name = line.split(":", 1)[1].strip()
-                return name if name and name != self.name else None
-        return None
+        # get-default-sink prints the name and nothing else. Parsing the
+        # "Default Sink:" line of `pactl info` would work here and quietly
+        # stop working under a translated locale, taking the ability to move
+        # streams anywhere with it.
+        r = run(["pactl", "get-default-sink"])
+        name = (r.stdout or "").strip()
+        if r.returncode != 0 or not name:
+            return None
+        return name if name != self.name else None
 
     def release_clients(self) -> list[str]:
         """Hand anything playing here back to the default sink.
@@ -373,8 +410,10 @@ class Capture:
                 channel_layout(self.channels) + ["-i", self.source] + \
                 self.fmt.encoder_args + ["-"]
             debug("capture:", " ".join(shlex.quote(c) for c in cmd))
+            # bufsize=0: we poll this pipe with a deadline, and a buffered
+            # reader would hide available bytes from select().
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
+                                 stderr=subprocess.PIPE, bufsize=0)
             self.procs = [p]
             self._watch_stderr(p, "ffmpeg")
             self.stdout = p.stdout
@@ -404,7 +443,7 @@ class Capture:
         p1 = subprocess.Popen(rec, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, bufsize=0)
         p2 = subprocess.Popen(enc, stdin=p1.stdout, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
+                              stderr=subprocess.PIPE, bufsize=0)
         p1.stdout.close()
         self.procs = [p1, p2]
         self._watch_stderr(p1, os.path.basename(recorder))
@@ -486,14 +525,23 @@ def ssdp_search(timeout: float = 4.0) -> list[str]:
     while time.time() < deadline:
         for s in socks:
             try:
-                data, _ = s.recvfrom(65507)
+                data, src = s.recvfrom(65507)
             except (socket.timeout, OSError):
                 continue
             for line in data.decode("utf-8", "replace").splitlines():
-                if line.upper().startswith("LOCATION:"):
-                    loc = line.split(":", 1)[1].strip()
-                    if loc:
-                        locations.add(loc)
+                if not line.upper().startswith("LOCATION:"):
+                    continue
+                loc = line.split(":", 1)[1].strip()
+                if not loc:
+                    continue
+                # The description has to live on the machine that answered.
+                # Anyone able to send us a datagram can claim to be a
+                # renderer; without this they also choose which URL we go
+                # and fetch.
+                if urllib.parse.urlsplit(loc).hostname != src[0]:
+                    debug(f"ignoring LOCATION {loc!r} announced by {src[0]}")
+                    continue
+                locations.add(loc)
     for s in socks:
         s.close()
     return sorted(locations)
@@ -503,8 +551,80 @@ def ssdp_search(timeout: float = 4.0) -> list[str]:
 # Renderer
 # --------------------------------------------------------------------------
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects.
+
+    We only ever talk to a device that answered our own search, on the
+    address it answered from. A redirect would let it hand that check to
+    somebody else's address after the fact.
+    """
+
+    def redirect_request(self, *a, **kw):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _read_capped(resp, limit: int, what: str,
+                 deadline: float = 30.0) -> bytes | None:
+    """Read a bounded body, bounded in time as well as in size.
+
+    A socket timeout only bounds one recv. A peer that dribbles a byte every
+    few seconds never trips it and holds the caller for as long as it likes -
+    and the caller here is the watchdog thread, the one thing that is
+    supposed to notice trouble. So the whole read gets a wall clock too.
+    """
+    end = time.monotonic() + deadline
+    chunks, total = [], 0
+    while total <= limit:
+        if time.monotonic() > end:
+            debug(f"{what} still arriving after {deadline:g}s, ignored")
+            return None
+        piece = resp.read(min(65536, limit + 1 - total))
+        if not piece:
+            return b"".join(chunks)
+        chunks.append(piece)
+        total += len(piece)
+    debug(f"{what} exceeds {limit} bytes, ignored")
+    return None
+
+
 def _tag(el) -> str:
     return el.tag.split("}", 1)[-1]
+
+
+def fetch_xml(url: str, timeout: float, limit: int = MAX_DESCRIPTION_BYTES):
+    """Fetch and parse a document some other machine told us about.
+
+    Anything on the network can answer an SSDP search, so this URL is
+    attacker-controlled and gets treated as such: only http(s), so a crafted
+    reply cannot make us read local files through file:// or ftp://; a size
+    cap, so it cannot hand us an endless body; and no DTD, because
+    ElementTree happily expands entities and a few lines of XML can turn
+    into gigabytes of memory.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        debug(f"refusing non-http description URL: {url!r}")
+        return None
+    try:
+        with _opener.open(url, timeout=timeout) as resp:
+            raw = _read_capped(resp, limit, f"description at {url}")
+    except Exception as e:
+        debug(f"description {url}: {type(e).__name__}: {e}")
+        return None
+    if raw is None:
+        return None
+    upper = raw[:8192].upper()
+    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        debug(f"description at {url} carries a DTD, ignored")
+        return None
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError as e:
+        debug(f"malformed description at {url}: {e}")
+        return None
 
 
 class Renderer:
@@ -523,15 +643,8 @@ class Renderer:
     @classmethod
     def from_location(cls, location: str, timeout: float = 6.0):
         r = cls(location)
-        try:
-            raw = urllib.request.urlopen(location, timeout=timeout).read()
-        except Exception as e:
-            debug(f"description {location}: {type(e).__name__}: {e}")
-            return None
-        try:
-            root = ET.fromstring(raw)
-        except ET.ParseError as e:
-            debug(f"malformed description at {location}: {e}")
+        root = fetch_xml(location, timeout)
+        if root is None:
             return None
 
         # <URLBase>, when present, overrides the location's base (UPnP 1.0).
@@ -585,8 +698,12 @@ class Renderer:
                 "Content-Type": 'text/xml; charset="utf-8"',
                 "SOAPAction": f'"{service}#{action}"',
                 "User-Agent": f"dlna-audio-sink/{__version__}"})
-        return urllib.request.urlopen(req, timeout=timeout).read() \
-            .decode("utf-8", "replace")
+        with _opener.open(req, timeout=timeout) as resp:
+            raw = _read_capped(resp, MAX_SOAP_BYTES,
+                               f"{action} answer from {self.host}")
+        if raw is None:
+            raise ValueError(f"{action}: answer too large")
+        return raw.decode("utf-8", "replace")
 
     def avt(self, action: str, body: str = "", timeout: float = 20.0) -> str:
         return self.soap(AVT, action, f"<InstanceID>0</InstanceID>{body}",
@@ -705,7 +822,15 @@ def discover(timeout: float = 4.0) -> list[Renderer]:
 
 class StreamState:
     def __init__(self, source: str, send_length: bool, rate: int,
-                 channels: int, use_pulse: bool, prebuffer: float = 2.0):
+                 channels: int, use_pulse: bool, prebuffer: float = 2.0,
+                 token: str = "", allowed_ip: str = ""):
+        # An unguessable path, and by default only the renderer's own address.
+        # Without both, every machine on the network can listen to this
+        # computer live, and any of them can cut the stream the renderer is
+        # playing simply by asking for it.
+        self.token = token
+        self.allowed_ip = allowed_ip
+        self.slots = threading.BoundedSemaphore(MAX_STREAM_CLIENTS)
         self.source = source
         self.send_length = send_length
         self.rate = rate
@@ -726,9 +851,45 @@ class StreamState:
             self.bytes_sent = 0
 
 
+class StreamServer(ThreadingHTTPServer):
+    """The HTTP side, with the noise a hostile peer can make bounded.
+
+    socketserver prints a full traceback for any exception escaping a
+    handler. A reset connection is routine here - renderers drop the stream
+    all the time - and printing a stack trace for each one hands anyone who
+    can reach the port a way to fill the journal.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        debug(f"connection from {client_address[0]}: {sys.exc_info()[1]!r}")
+
+
 def make_handler(state: StreamState):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Bounded, so a peer that connects and never speaks cannot keep a
+        # thread. Re-armed to a shorter value once we start writing.
+        timeout = CLIENT_READ_TIMEOUT
+
+        def authorised(self) -> bool:
+            if not state.token:          # jamais d'accès sans capability
+                return False
+            # Bytes, not str: the request line arrives as latin-1 and
+            # compare_digest raises TypeError on anything non-ASCII, which
+            # would hand a peer a crash for the price of one odd character.
+            path = urllib.parse.urlsplit(self.path).path
+            want = f"/stream/{state.token}".encode()
+            if not hmac.compare_digest(path.encode("utf-8", "replace"), want):
+                return False
+            if state.allowed_ip and self.client_address[0] != state.allowed_ip:
+                log(f"refused {self.client_address[0]}: expected the "
+                    f"renderer at {state.allowed_ip} "
+                    f"(--allow-any-client to permit it)")
+                return False
+            return True
 
         def log_message(self, *a):
             debug(f"{self.command} {self.path} <- {self.client_address[0]}")
@@ -749,6 +910,9 @@ def make_handler(state: StreamState):
             self.end_headers()
 
         def do_HEAD(self):
+            if not self.authorised():
+                self.send_error(404)
+                return
             if state.fmt is None:
                 self.send_error(503)
                 return
@@ -758,10 +922,23 @@ def make_handler(state: StreamState):
                 pass
 
         def do_GET(self):
+            if not self.authorised():
+                self.send_error(404)
+                return
             fmt = state.fmt
             if fmt is None:
                 self.send_error(503)
                 return
+            if not state.slots.acquire(blocking=False):
+                log("refusing a stream: too many already open")
+                self.send_error(503)
+                return
+            try:
+                self.stream(fmt)
+            finally:
+                state.slots.release()
+
+        def stream(self, fmt):
             if self.headers.get("Range"):
                 # Live stream: position is meaningless. Renderers observed in
                 # the wild send "bytes=0-" and accept a plain 200.
@@ -774,13 +951,30 @@ def make_handler(state: StreamState):
                 state.last_activity = time.time()
                 # Only one stream at a time: a reconnecting renderer must not
                 # leave an orphaned encoder running.
-                if state.current is not None:
-                    debug("replacing the previous stream")
-                    state.current.stop()
                 cap = Capture(state.source, fmt, state.rate, state.channels,
                               state.use_pulse)
-                state.current = cap
+                previous, state.current = state.current, cap
 
+            # Outside the lock on purpose: stop() waits on processes, and the
+            # streaming loop below takes this same lock on every chunk.
+            if previous is not None:
+                debug("replacing the previous stream")
+                previous.stop()
+
+            try:
+                self.serve_capture(fmt, cap)
+            finally:
+                # Every exit passes here. state.active is what tells the
+                # watchdog whether anyone is listening; leaking it once is
+                # enough to disable the "renderer stopped reading" check for
+                # the rest of the run.
+                self.close_connection = True
+                with state.lock:
+                    state.active -= 1
+                    if state.current is cap:
+                        state.current = None
+
+        def serve_capture(self, fmt, cap):
             try:
                 cap.start()
             except Exception as e:
@@ -798,8 +992,31 @@ def make_handler(state: StreamState):
                 cap.stop()
                 return
 
+            # From here on, a peer that stops accepting data costs us this
+            # connection and nothing more. Without a send timeout the write
+            # blocks for ever, the encoder's pipe fills behind it, and the
+            # encoder stops draining the audio monitor: a stalled television
+            # reaching all the way into the sound graph of this machine.
+            self.connection.settimeout(CLIENT_SEND_TIMEOUT)
+
             log(f"streaming {fmt.name} to {self.client_address[0]}")
             sent = 0
+            sel = selectors.DefaultSelector()
+            sel.register(cap.stdout, selectors.EVENT_READ)
+
+            def pull(size: int = 16384) -> bytes:
+                """A chunk from the encoder, b"" once it has gone quiet.
+
+                A blocking read here would be the same trap in the other
+                direction: an encoder that stops producing - device busy,
+                process wedged - would hold this thread for ever, and with
+                it the capture slot the renderer needs.
+                """
+                if not sel.select(CAPTURE_READ_TIMEOUT):
+                    debug(f"encoder produced nothing for "
+                          f"{CAPTURE_READ_TIMEOUT:g}s")
+                    return b""
+                return cap.stdout.read(size) or b""
 
             # We can only ever produce in real time, so a renderer that reads
             # as fast as we write never builds any reserve: it plays with an
@@ -810,7 +1027,7 @@ def make_handler(state: StreamState):
             if state.prebuffer > 0:
                 cushion, until = [], time.time() + state.prebuffer
                 while time.time() < until:
-                    c = cap.stdout.read(16384)
+                    c = pull()
                     if not c:
                         break
                     cushion.append(c)
@@ -820,13 +1037,14 @@ def make_handler(state: StreamState):
                         sent += len(c)
                     debug(f"prebuffered {sent} bytes "
                           f"({state.prebuffer:.1f}s cushion)")
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                    sel.close()
                     cap.stop()
                     return
 
             try:
                 while True:
-                    chunk = cap.stdout.read(16384)
+                    chunk = pull()
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -836,17 +1054,17 @@ def make_handler(state: StreamState):
                         state.last_activity = time.time()
             except (BrokenPipeError, ConnectionResetError):
                 debug(f"client closed the stream after {sent} bytes")
+            except TimeoutError:
+                log(f"{self.client_address[0]} stopped reading after "
+                    f"{sent} bytes; dropping it rather than stalling capture")
             except Exception as e:
                 debug(f"stream error: {type(e).__name__}: {e}")
             finally:
+                sel.close()
                 if sent == 0 and cap.died_early():
                     state.last_error = cap.failure_text() or "encoder exited"
                     log(f"capture produced nothing: {state.last_error}")
                 cap.stop()
-                with state.lock:
-                    state.active -= 1
-                    if state.current is cap:
-                        state.current = None
     return Handler
 
 
@@ -1082,6 +1300,9 @@ def cmd_run(args) -> int:
         source = args.source
         label = args.source
         log(f"capturing existing source '{source}'")
+        if not source.endswith(".monitor"):
+            log("note: this is a capture device, not a monitor - it may be "
+                "a microphone, and it will be reachable over the network")
     else:
         sink_name = args.sink_name or sanitize(renderer.name)
         label = args.description or renderer.name
@@ -1089,17 +1310,26 @@ def cmd_run(args) -> int:
         sink.create(force=args.force_sink)
         source = sink.monitor
 
+    # The stream carries whatever this machine is playing, so the URL is a
+    # capability: unguessable, and by default usable only from the renderer
+    # we are talking to. Anyone who can reach the port would otherwise be
+    # able to listen in, and to cut the renderer's stream by asking for it.
+    token = secrets.token_urlsafe(16)
+    allowed = "" if args.allow_any_client else renderer.host
+    if not allowed:
+        log("note: --allow-any-client is set; any host that guesses the "
+            "stream URL can listen")
     state = StreamState(source, send_length=not args.no_content_length,
                         rate=rate, channels=channels,
-                        use_pulse=use_pulse, prebuffer=args.prebuffer)
+                        use_pulse=use_pulse, prebuffer=args.prebuffer,
+                        token=token, allowed_ip=allowed)
     bind_addr = args.bind
     if ":" in local_ip:                       # IPv6 renderer
         if bind_addr == "0.0.0.0":
             bind_addr = "::"
-        ThreadingHTTPServer.address_family = socket.AF_INET6
+        StreamServer.address_family = socket.AF_INET6
     try:
-        httpd = ThreadingHTTPServer((bind_addr, args.port),
-                                    make_handler(state))
+        httpd = StreamServer((bind_addr, args.port), make_handler(state))
     except OSError as e:
         if sink:
             sink.destroy()
@@ -1110,8 +1340,9 @@ def cmd_run(args) -> int:
     httpd.daemon_threads = True
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    url = f"http://{url_host(local_ip)}:{port}/stream"
-    log(f"serving {url}")
+    url = f"http://{url_host(local_ip)}:{port}/stream/{token}"
+    # The token is a credential: the renderer gets it, the journal does not.
+    log(f"serving http://{url_host(local_ip)}:{port}/stream/…")
 
     stopping = threading.Event()
 
@@ -1317,6 +1548,10 @@ def main() -> int:
     p.add_argument("--port", type=int, default=0,
                    help="HTTP port (default: an ephemeral one)")
     p.add_argument("--bind", default="0.0.0.0", help="HTTP bind address")
+    p.add_argument("--allow-any-client", action="store_true",
+                   help="serve the stream to any host that has the URL, not "
+                        "only the renderer (needed if it fetches from a "
+                        "different address than it answers on)")
     p.add_argument("--local-ip", help="address the renderer should connect to")
     p.add_argument("--timeout", type=float, default=4.0,
                    help="SSDP discovery timeout")
