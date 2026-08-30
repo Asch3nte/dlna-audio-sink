@@ -197,10 +197,72 @@ class NullSink:
                 return parts[0]
         return None
 
+    def _sink_id(self) -> str | None:
+        r = run(["pactl", "list", "short", "sinks"])
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1] == self.name:
+                return parts[0]
+        return None
+
+    def _default_sink(self) -> str | None:
+        r = run(["pactl", "info"])
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("Default Sink:"):
+                name = line.split(":", 1)[1].strip()
+                return name if name and name != self.name else None
+        return None
+
+    def release_clients(self) -> list[str]:
+        """Hand anything playing here back to the default sink.
+
+        Unloading the module with streams still attached leaves the server to
+        re-route them after the fact. A client does not necessarily cope with
+        its sink vanishing underneath it mid-stream, and when it does not the
+        damage is silent: the process stays up, its stream stays listed, and
+        only the far end notices that nothing is being consumed any more.
+
+        Moving them first is the same thing the user would do by hand, in the
+        order the client expects, and it costs one pactl call per stream. We
+        do it whenever the sink is about to go, whoever asked for it.
+        """
+        sink_id = self._sink_id()
+        target = self._default_sink()
+        if sink_id is None or target is None:
+            return []
+        moved = []
+        r = run(["pactl", "list", "short", "sink-inputs"])
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1] == sink_id:
+                run(["pactl", "move-sink-input", parts[0], target])
+                moved.append(parts[0])
+        if moved:
+            log(f"moved {len(moved)} stream(s) to '{target}' before removing "
+                f"the sink")
+        return moved
+
+    def reclaim_clients(self, streams: list[str]) -> None:
+        """Bring back the streams that were playing here before it went.
+
+        Losing the renderer should cost the listener the renderer, not their
+        choice of output: an application parked on this sink belongs here
+        once it exists again. Best effort by design - a stream that ended or
+        whose client restarted in the meantime is simply skipped, and pactl
+        says so without us having to check first.
+        """
+        if not streams or self._sink_id() is None:
+            return
+        back = [s for s in streams
+                if run(["pactl", "move-sink-input", s, self.name]).returncode == 0]
+        if back:
+            log(f"returned {len(back)} stream(s) to '{self.name}'")
+
     def create(self, force: bool = False, fatal: bool = True) -> bool:
         existing = self._find_module()
         if existing and force:
             log(f"unloading stale sink module {existing}")
+            self.release_clients()
             run(["pactl", "unload-module", existing])
             existing = None
         if existing:
@@ -233,11 +295,12 @@ class NullSink:
 
     def destroy(self) -> None:
         if self.module:
+            self.release_clients()
             run(["pactl", "unload-module", self.module])
             debug(f"sink module {self.module} unloaded")
             self.module = None
 
-    def teardown(self) -> None:
+    def teardown(self) -> list[str]:
         """Remove the sink even if we adopted it from an earlier run.
 
         destroy() is the shutdown path and deliberately leaves alone a
@@ -248,11 +311,13 @@ class NullSink:
         """
         module = self.module or self._find_module()
         if not module:
-            return
+            return []
+        moved = self.release_clients()
         run(["pactl", "unload-module", module])
         log(f"sink '{self.name}' removed (module {module})")
         self.module = None
         self.reused = False
+        return moved
 
     @property
     def monitor(self) -> str:
@@ -1114,6 +1179,7 @@ def cmd_run(args) -> int:
     # the default sink, which is where they would have been all along.
     offline = False
     unreachable = 0
+    displaced: list[str] = []      # streams parked elsewhere while offline
 
     def go_offline(reason: str) -> None:
         nonlocal offline, unreachable, delay
@@ -1127,12 +1193,16 @@ def cmd_run(args) -> int:
             cap.stop()
         state.reset_stream_accounting()
         if sink:
-            sink.teardown()
+            displaced.clear()
+            displaced.extend(sink.teardown())
 
     def come_back(st: str) -> None:
         nonlocal offline, delay, not_playing
         if sink and not sink.create(force=True, fatal=False):
             return                      # sound server busy; try again later
+        if sink:
+            sink.reclaim_clients(displaced)
+            displaced.clear()
         log(f"renderer answered again (state={st})")
         offline = False
         not_playing = 0

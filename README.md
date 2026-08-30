@@ -110,8 +110,9 @@ dlna-audio-sink -r "Living Room" --source alsa_input.pci-0000_00_1f.3.analog-ste
    state, or is about to reach the end of the length we declared. It backs off
    if restarting keeps failing, and once the renderer has stopped answering
    altogether it **removes the sink** rather than leave a dead one behind
-   (see below). The sink comes back, and playback with it, as soon as the
-   device answers again.
+   (see below). Anything playing into it is handed to the default sink first
+   and put back when the sink returns, so losing the renderer costs you the
+   renderer, not your choice of output.
 
 ## Two things that make this harder than it looks
 
@@ -170,14 +171,18 @@ is running system-wide instead of in your user session. It must be a *user*
 unit (`systemctl --user`), because that is where PipeWire lives.
 
 **The sink vanished from my audio settings.** The renderer stopped
-answering, so the sink was removed on purpose. A sink whose monitor nobody
-drains any more still accepts clients, and anything routed into it stops dead
-while looking perfectly healthy — a stream that reads as running, a latency of
-zero, and a silent player at the other end. Worse, `module-stream-restore`
-will route a client there by itself, remembering a session from when the
-device was still up. Removing the module hands those clients back to your
-default sink. Switch the device on and the sink reappears within half a
-minute.
+answering, so the sink was removed on purpose: one that leads nowhere is worse
+than none, and `module-stream-restore` will route a client onto it by itself,
+remembering a session from when the device was still up. Switch the device on
+and the sink reappears within half a minute.
+
+Whatever was playing into it is moved to your default sink *before* the module
+goes, never orphaned by it — a client is not obliged to survive its sink
+disappearing mid-stream, and when it does not, the failure is silent: the
+process stays up, the stream stays listed at full volume, and only the far end
+notices that nothing is being consumed. Those streams are moved back when the
+sink returns. It is best effort: a stream that ended, or whose application
+restarted meanwhile, is left where it is.
 
 **The sound is delayed.** That is expected; see below.
 
